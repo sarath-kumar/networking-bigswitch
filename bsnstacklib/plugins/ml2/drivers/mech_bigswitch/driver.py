@@ -40,8 +40,6 @@ from bsnstacklib.plugins.bigswitch.i18n import _LE
 from bsnstacklib.plugins.bigswitch.i18n import _LW
 from bsnstacklib.plugins.bigswitch import plugin
 from bsnstacklib.plugins.bigswitch import servermanager
-from bsnstacklib.plugins.bigswitch.config import VSwitchType,\
-    VHOST_USER_SOCKET_DIR
 
 EXTERNAL_PORT_OWNER = 'neutron:external_port'
 ROUTER_GATEWAY_PORT_OWNER = 'network:router_gateway'
@@ -74,7 +72,7 @@ class BigSwitchMechanismDriver(plugin.NeutronRestProxyV2Base,
         self.servers.get_topo_function = self._get_all_data_auto
         self.segmentation_types = ', '.join(cfg.CONF.ml2.type_drivers)
         # Track hosts running IVS to avoid excessive calls to the backend
-        self.vswitch_host_cache = {}
+        self.ivs_host_cache = {}
         self.setup_sg_rpc_callbacks()
         LOG.debug("Initialization done")
 
@@ -290,47 +288,6 @@ class BigSwitchMechanismDriver(plugin.NeutronRestProxyV2Base,
             return False
         return prepped_port
 
-    def _bind_port_nfvswitch(self, context):
-        """Perform bind_port for nfvswitch.
-
-        A NFV VM needs to be attached to a nfv-switch socket. So, during
-        bind_port() we create a NFV VM endpoint on BCF, thereby reserving the
-        socket for it's use. Then pass the sock_path in the set_binding() for
-        Nova to plug the VM to the nfv-switch.
-
-        @param context: PortContext object
-        """
-        port = self._prepare_port_for_controller(context)
-        if port:
-            # Set the vif_type to 'vhost_user' to notify BCF to reserve a
-            # nfvswitch socket
-            port.vif_type = portbindings.VIF_TYPE_VHOST_USER
-            self.async_port_create(port["network"]["tenant_id"],
-                                   port["network"]["id"], port)
-        sock = "vhost0.sock"
-        sock_path = self._get_vhost_user_sock_path(sock)
-        for segment in context.segments_to_bind:
-            if segment[api.NETWORK_TYPE] == pconst.TYPE_VLAN:
-                # TODO(sarath): tune the set_binding() vif_details params
-                context.set_binding(
-                    segment[api.ID], portbindings.VIF_TYPE_VHOST_USER,
-                    {portbindings.CAP_PORT_FILTER: False,
-                     portbindings.VHOST_USER_MODE:
-                        portbindings.VHOST_USER_MODE_CLIENT,
-                     portbindings.VHOST_USER_OVS_PLUG: True,
-                     portbindings.VHOST_USER_SOCKET: sock_path})
-
-    def _bind_port_ivswitch(self, context):
-        """Perform bind_port for Indigo virtual switch.
-
-        @param context: PortContext object
-        """
-        for segment in context.segments_to_bind:
-            if segment[api.NETWORK_TYPE] == pconst.TYPE_VLAN:
-                context.set_binding(segment[api.ID], pl_config.VIF_TYPE_IVS,
-                                    {portbindings.CAP_PORT_FILTER: True,
-                                     portbindings.OVS_HYBRID_PLUG: True})
-
     def bind_port(self, context):
         """Marks ports as bound.
 
@@ -350,22 +307,21 @@ class BigSwitchMechanismDriver(plugin.NeutronRestProxyV2Base,
                          portbindings.OVS_HYBRID_PLUG: False})
                     return
 
-        # IVS and NFV hosts will have a vswitch with the same name as hostname
-        vswitch_type = self.get_vswitch_type(context.host)
-        if vswitch_type == VSwitchType.NFVSWITCH:
-            self._bind_port_nfvswitch(context)
-        elif vswitch_type == VSwitchType.VIRTUAL:
-            self._bind_port_ivswitch(context)
+        # IVS hosts will have a vswitch with the same name as the hostname
+        if self.does_vswitch_exist(context.host):
+            for segment in context.segments_to_bind:
+                if segment[api.NETWORK_TYPE] == pconst.TYPE_VLAN:
+                    context.set_binding(
+                        segment[api.ID], pl_config.VIF_TYPE_IVS,
+                        {portbindings.CAP_PORT_FILTER: True,
+                        portbindings.OVS_HYBRID_PLUG: True})
 
-    def get_vswitch_type(self, host):
-        """Get virtual switch type
-        Check if a virtual switch exists with the given hostname on BCF, if
-        it does, return its type.
+    def does_vswitch_exist(self, host):
+        """Check if Indigo vswitch exists with the given hostname.
 
-        @param host: the HOST_ID.
-        @returns: switch-type, if the vswitch is known to BCF.
-                  None, if vswitch is unknown to BCF or backend couldn't be
-                  reached.
+        Returns True if switch exists on backend.
+        Returns False if switch does not exist.
+        Returns None if backend could not be reached.
         Caches response from backend.
         """
         try:
@@ -374,43 +330,26 @@ class BigSwitchMechanismDriver(plugin.NeutronRestProxyV2Base,
             # cache was empty for that switch or expired
             pass
 
-        switch_type = None
         try:
-            resp = self.servers.rest_get_switch(host)
-            exists = bool(resp)
-            if exists:
-                switch_type = resp[0]["fabric-role"]
+            exists = bool(self.servers.rest_get_switch(host))
         except servermanager.RemoteRestError:
             # Connectivity or internal server error. Skip cache to try again on
             # next binding attempt
             return
-
-        self.vswitch_host_cache[host] = {
-            'type': switch_type,
+        self.ivs_host_cache[host] = {
             'timestamp': datetime.datetime.now(),
             'exists': exists
         }
-        return switch_type
+        return exists
 
     def _get_cached_vswitch_existence(self, host):
-        """Returns cached existence. Expired and non-cached raise ValueError.
-        """
-        entry = self.vswitch_host_cache.get(host)
+        """Returns cached existence. Old and non-cached raise ValueError."""
+        entry = self.ivs_host_cache.get(host)
         if not entry:
             raise ValueError(_('No cache entry for host %s') % host)
-
         diff = timeutils.delta_seconds(entry['timestamp'],
                                        datetime.datetime.now())
         if diff > CACHE_VSWITCH_TIME:
-            self.vswitch_host_cache.pop(host)
+            self.ivs_host_cache.pop(host)
             raise ValueError(_('Expired cache entry for host %s') % host)
-
-        if entry['exists']:
-            return entry['type']
-        return None
-
-    def _get_vhost_user_sock_path(self, sock):
-        """Get the socket path for the vhost_user socket. """
-        if not sock:
-            return None
-        return VHOST_USER_SOCKET_DIR + str(sock)
+        return entry['exists']
